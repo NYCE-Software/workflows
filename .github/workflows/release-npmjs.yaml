@@ -1,0 +1,137 @@
+name: Release to npmjs.com
+
+on:
+    workflow_call:
+        inputs:
+            node-version:
+                description: Node.js version to run with. Needs npm 11.15.0 or later, so use 24 or later.
+                type: string
+                default: "24"
+            playwright-browsers:
+                description: Playwright browsers to install before the tests, separated by spaces. Empty installs none.
+                type: string
+                default: ""
+            environment:
+                description: GitHub environment the stage job runs in. The npm trusted publisher names the same environment.
+                type: string
+                default: npm
+
+permissions: {}
+
+jobs:
+    build:
+        name: Check, build and pack
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+        steps:
+            - name: Check out the code
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+                  fetch-depth: 0
+            - name: Check the release tag
+              env:
+                  REF_TYPE: ${{ github.ref_type }}
+                  REF_NAME: ${{ github.ref_name }}
+                  COMMIT: ${{ github.sha }}
+                  REPOSITORY: ${{ github.repository }}
+                  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+              run: |
+                  set -euo pipefail
+                  if [ "$REF_TYPE" != "tag" ]; then
+                      echo "A release runs from a version tag, not from the $REF_TYPE $REF_NAME." >&2
+                      exit 1
+                  fi
+                  if ! [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                      echo "The tag $REF_NAME is not in the form v1.2.3." >&2
+                      exit 1
+                  fi
+                  package_version="$(jq -r .version package.json)"
+                  if [ "v$package_version" != "$REF_NAME" ]; then
+                      echo "The tag is $REF_NAME but package.json says $package_version." >&2
+                      exit 1
+                  fi
+                  if ! git merge-base --is-ancestor "$COMMIT" "origin/$DEFAULT_BRANCH"; then
+                      echo "The tagged commit is not on $DEFAULT_BRANCH." >&2
+                      exit 1
+                  fi
+                  repository_url="$(jq -r '.repository.url // empty' package.json)"
+                  expected_url="https://github.com/${REPOSITORY}"
+                  normalised_url="${repository_url#git+}"
+                  normalised_url="${normalised_url%.git}"
+                  if [ "$normalised_url" != "$expected_url" ]; then
+                      echo "repository.url is '$repository_url'. npm needs it to match $expected_url." >&2
+                      exit 1
+                  fi
+            - name: Set up pnpm
+              uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+            - name: Set up Node.js
+              uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+              with:
+                  node-version: ${{ inputs.node-version }}
+                  package-manager-cache: false
+            - name: Check the version is not published yet
+              run: npm run check-version-collision
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+            - name: Install Playwright browsers
+              if: inputs.playwright-browsers != ''
+              run: |
+                  read -ra browsers <<< "$PLAYWRIGHT_BROWSERS"
+                  pnpm exec playwright install --with-deps "${browsers[@]}"
+              env:
+                  PLAYWRIGHT_BROWSERS: ${{ inputs.playwright-browsers }}
+            - name: Build
+              run: pnpm run build
+            - name: Test
+              run: pnpm run test
+            - name: Pack
+              run: pnpm pack --pack-destination "$RUNNER_TEMP/package"
+            - name: Keep the tarball for the stage job
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+              with:
+                  name: package
+                  path: ${{ runner.temp }}/package/*.tgz
+                  if-no-files-found: error
+                  retention-days: 7
+
+    stage:
+        name: Stage on npmjs.com
+        needs: build
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        environment: ${{ inputs.environment }}
+        permissions:
+            id-token: write # npm swaps this job's OIDC token for permission to stage the release
+        steps:
+            - name: Set up Node.js
+              uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+              with:
+                  node-version: ${{ inputs.node-version }}
+                  package-manager-cache: false
+            - name: Check the npm version
+              run: |
+                  npm_version="$(npm --version)"
+                  echo "npm $npm_version"
+                  if ! printf '%s\n' "11.15.0" "$npm_version" | sort -V -C; then
+                      echo "npm $npm_version is older than 11.15.0, which staged publishing needs." >&2
+                      exit 1
+                  fi
+            - name: Fetch the tarball
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+              with:
+                  name: package
+                  path: ${{ runner.temp }}/package
+            - name: Stage the release
+              run: |
+                  set -euo pipefail
+                  tarballs=("$RUNNER_TEMP"/package/*.tgz)
+                  if [ "${#tarballs[@]}" -ne 1 ]; then
+                      echo "Expected one tarball, found ${#tarballs[@]}." >&2
+                      exit 1
+                  fi
+                  npm stage publish "${tarballs[0]}" --access public --provenance
+                  release="$(tar -xzOf "${tarballs[0]}" package/package.json | jq -r '"\(.name)@\(.version)"')"
+                  echo "Staged $release. Approve it on npmjs.com." >> "$GITHUB_STEP_SUMMARY"

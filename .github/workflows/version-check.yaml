@@ -1,0 +1,35 @@
+name: Version check
+
+on:
+    workflow_call:
+        inputs:
+            github-packages:
+                description: Look the version up on GitHub Packages instead of npmjs.com. Needs packages read.
+                type: boolean
+                default: false
+
+permissions: {}
+
+jobs:
+    version-check:
+        name: Check that the version is new
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        permissions:
+            contents: read
+            packages: read
+        steps:
+            - name: Check out the code
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+            - name: Set up Node.js
+              uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+              with:
+                  node-version: "24"
+                  package-manager-cache: false
+                  registry-url: ${{ inputs.github-packages && 'https://npm.pkg.github.com' || '' }}
+            - name: Check the version is not published yet
+              run: npm run check-version-collision
+              env:
+                  NODE_AUTH_TOKEN: ${{ inputs.github-packages && github.token || '' }}

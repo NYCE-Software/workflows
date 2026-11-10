@@ -1,0 +1,57 @@
+name: Dependabot version bump
+
+on:
+    workflow_call:
+
+permissions: {}
+
+jobs:
+    bump:
+        name: Bump the patch version
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        permissions:
+            contents: write # pushes the version bump to the pull request branch
+        steps:
+            - name: Check this is a pull request branch in this repository
+              env:
+                  EVENT_NAME: ${{ github.event_name }}
+                  HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+                  REPOSITORY: ${{ github.repository }}
+              run: |
+                  if [ "$EVENT_NAME" != "pull_request" ] || [ "$HEAD_REPOSITORY" != "$REPOSITORY" ]; then
+                      echo "This workflow only bumps pull request branches in $REPOSITORY." >&2
+                      exit 1
+                  fi
+            - name: Check out the pull request branch
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  ref: ${{ github.head_ref }}
+                  persist-credentials: false
+            - name: Set up Node.js
+              uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+              with:
+                  node-version: "24"
+                  package-manager-cache: false
+            - name: Bump the patch version unless the branch already did
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  REPOSITORY: ${{ github.repository }}
+                  BASE_REF: ${{ github.base_ref }}
+                  HEAD_REF: ${{ github.head_ref }}
+              run: |
+                  set -euo pipefail
+                  remote="https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git"
+                  git fetch --depth=1 "$remote" "$BASE_REF"
+                  base_version="$(git show FETCH_HEAD:package.json | jq -r .version)"
+                  branch_version="$(jq -r .version package.json)"
+                  if [ "$base_version" != "$branch_version" ]; then
+                      echo "The branch already changes the version ($base_version to $branch_version). Nothing to do."
+                      exit 0
+                  fi
+                  npm run version:dependabot
+                  git config user.name 'github-actions[bot]'
+                  git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+                  git add package.json
+                  git commit -m "Bump the patch version for the Dependabot update"
+                  git push "$remote" "HEAD:refs/heads/${HEAD_REF}"

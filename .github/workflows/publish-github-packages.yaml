@@ -1,0 +1,92 @@
+name: Publish to GitHub Packages
+
+on:
+    workflow_call:
+        inputs:
+            node-version:
+                description: Node.js version to run with.
+                type: string
+                default: "24"
+            playwright-browsers:
+                description: Playwright browsers to install before the tests, separated by spaces. Empty installs none.
+                type: string
+                default: ""
+
+permissions: {}
+
+jobs:
+    build:
+        name: Build and pack
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+            packages: read
+        steps:
+            - name: Check out the code
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+            - name: Set up pnpm
+              uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+            - name: Set up Node.js
+              uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+              with:
+                  node-version: ${{ inputs.node-version }}
+                  package-manager-cache: false
+                  registry-url: https://npm.pkg.github.com
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+              env:
+                  NODE_AUTH_TOKEN: ${{ github.token }}
+            - name: Install Playwright browsers
+              if: inputs.playwright-browsers != ''
+              run: |
+                  read -ra browsers <<< "$PLAYWRIGHT_BROWSERS"
+                  pnpm exec playwright install --with-deps "${browsers[@]}"
+              env:
+                  PLAYWRIGHT_BROWSERS: ${{ inputs.playwright-browsers }}
+            - name: Build
+              run: pnpm run build
+            - name: Test
+              run: pnpm run test
+            - name: Pack
+              run: pnpm pack --pack-destination "$RUNNER_TEMP/package"
+            - name: Keep the tarball for the publish job
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+              with:
+                  name: package
+                  path: ${{ runner.temp }}/package/*.tgz
+                  if-no-files-found: error
+                  retention-days: 7
+
+    publish:
+        name: Publish to GitHub Packages
+        needs: build
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        permissions:
+            packages: write # publishes the package with the job token
+        steps:
+            - name: Set up Node.js
+              uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+              with:
+                  node-version: ${{ inputs.node-version }}
+                  package-manager-cache: false
+                  registry-url: https://npm.pkg.github.com
+            - name: Fetch the tarball
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+              with:
+                  name: package
+                  path: ${{ runner.temp }}/package
+            - name: Publish
+              run: | # zizmor: ignore[use-trusted-publishing] GitHub Packages has no trusted publishing, so the job token is the only way in
+                  set -euo pipefail
+                  tarballs=("$RUNNER_TEMP"/package/*.tgz)
+                  if [ "${#tarballs[@]}" -ne 1 ]; then
+                      echo "Expected one tarball, found ${#tarballs[@]}." >&2
+                      exit 1
+                  fi
+                  npm publish "${tarballs[0]}"
+              env:
+                  NODE_AUTH_TOKEN: ${{ github.token }}
